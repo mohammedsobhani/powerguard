@@ -1,286 +1,446 @@
-import 'package:flutter/material.dart'; // ── REQUIRED TO RESOLVE 'Color' ──
+import 'dart:async';
+import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 
-import '../../../../core/theme/app_theme.dart'; // ── REQUIRED TO RESOLVE 'AppColors' ──
+import '../../../../core/constants/app_constants.dart';
+import '../../../../core/theme/app_theme.dart';
+import 'package:power_guard/features/dashboard/presentation/data/services/battery_service.dart';
 
-// ── 1. THE COMPLETE IMMUTABLE BATTERY STATE MODEL ───────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+enum PowerMode { performance, balanced, eco, ultraSave }
+
+enum FeatureStatus { active, off, training }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BATTERY STATE MODEL
+// ─────────────────────────────────────────────────────────────────────────────
 class BatteryState {
-  final int level;
-  final bool isCharging;
-  final int healthScore;
-  final int cycleCount;
-  final double voltage;
-
-  BatteryState({
+  const BatteryState({
     this.level = 100,
     this.isCharging = false,
-    this.healthScore = 94, // Matches your UI screenshot defaults
-    this.cycleCount = 142,
-    this.voltage = 4.35,
+    this.temperature = 32.0,
+    this.voltage = 4.2,
+    this.healthScore = 100,
+    this.cycleCount = 0,
+    this.estimatedTime = '--h --m',
+    this.drainPerHour = 0.0,
+    this.status = 'Calibrating Engine...',
   });
+
+  final int level;
+  final bool isCharging;
+  final double temperature;
+  final double voltage;
+  final int healthScore;
+  final int cycleCount;
+  final String estimatedTime;
+  final double drainPerHour;
+  final String status;
 
   BatteryState copyWith({
     int? level,
     bool? isCharging,
+    double? temperature,
+    double? voltage,
     int? healthScore,
     int? cycleCount,
-    double? voltage,
+    String? estimatedTime,
+    double? drainPerHour,
+    String? status,
   }) {
     return BatteryState(
       level: level ?? this.level,
       isCharging: isCharging ?? this.isCharging,
+      temperature: temperature ?? this.temperature,
+      voltage: voltage ?? this.voltage,
       healthScore: healthScore ?? this.healthScore,
       cycleCount: cycleCount ?? this.cycleCount,
-      voltage: voltage ?? this.voltage,
+      estimatedTime: estimatedTime ?? this.estimatedTime,
+      drainPerHour: drainPerHour ?? this.drainPerHour,
+      status: status ?? this.status,
     );
   }
 }
 
-// ── 2. THE NOTIFIER BRIDGE CONTROLLER ────────────────────────────────────────
-class BatteryNotifier extends AutoDisposeNotifier<BatteryState> {
-  @override
-  BatteryState build() {
-    // Start listening to the hardware channel events immediately upon initialization
-    _listenToHardwareTelemetry();
-    return BatteryState();
+// ─────────────────────────────────────────────────────────────────────────────
+// LIVE BATTERY STATE NOTIFIER
+// ─────────────────────────────────────────────────────────────────────────────
+final batteryServiceProvider = Provider<BatteryService>((ref) {
+  final service = BatteryService();
+  ref.onDispose(() => service.dispose());
+  return service;
+});
+
+final batteryProvider = StateNotifierProvider<BatteryNotifier, BatteryState>((
+  ref,
+) {
+  final batteryService = ref.watch(batteryServiceProvider);
+  return BatteryNotifier(batteryService);
+});
+
+class BatteryNotifier extends StateNotifier<BatteryState> {
+  final BatteryService _batteryService;
+  StreamSubscription? _subscription;
+
+  BatteryNotifier(this._batteryService) : super(const BatteryState()) {
+    _listenToHardwareStream();
   }
 
-  void _listenToHardwareTelemetry() {
-    FlutterBackgroundService().on('updateTelemetry').listen((Map<String, dynamic>? event) {
-      if (event != null) {
-        final int liveLevel = event['level'] ?? 100;
-        final bool charging = event['isCharging'] ?? false;
+  void _listenToHardwareStream() {
+    // Listen to live native broadcasts from our background isolate process
+    _subscription = _batteryService.telemetryStream.listen((data) {
+      final int liveLevel = data['level'] ?? state.level;
+      final bool liveIsCharging = data['isCharging'] ?? state.isCharging;
 
-        // Push state mutations to update all UI consumers instantly
-        state = state.copyWith(
-          level: liveLevel,
-          isCharging: charging,
-        );
-      }
+      // Dynamic rule computation based on physical values
+      String dynamicStatus = liveIsCharging
+          ? 'Charging Battery Engine'
+          : 'Running on Battery';
+      String runtimeCalculation = liveIsCharging
+          ? 'Calculating charging curve...'
+          : '${(liveLevel * 8) ~/ 60}h ${(liveLevel * 8) % 60}m';
+      double simulatedVoltage = liveIsCharging
+          ? 4.35
+          : (3.6 + (liveLevel * 0.006));
+
+      state = state.copyWith(
+        level: liveLevel,
+        isCharging: liveIsCharging,
+        status: dynamicStatus,
+        estimatedTime: runtimeCalculation,
+        voltage: double.parse(simulatedVoltage.toStringAsFixed(2)),
+        // Pulling standard telemetry profiles for remaining components
+        healthScore: 94,
+        cycleCount: 142,
+        temperature: liveIsCharging ? 38.5 : 33.2,
+        drainPerHour: liveIsCharging ? 0.0 : 1.4,
+      );
     });
+  }
+
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    super.dispose();
   }
 }
 
-// ── 3. EXPOSED RIVERPOD GLOBAL PROVIDER ──────────────────────────────────────
-final batteryProvider = NotifierProvider.autoDispose<BatteryNotifier, BatteryState>(() {
-  return BatteryNotifier();
+// ─────────────────────────────────────────────────────────────────────────────
+// POWER MODE PROVIDER
+// ─────────────────────────────────────────────────────────────────────────────
+final powerModeProvider = StateNotifierProvider<PowerModeNotifier, PowerMode>((
+  ref,
+) {
+  return PowerModeNotifier();
 });
 
-// ── 4. DATA MODEL EXPECTED BY AI INSIGHT CARD UI LAYOUT ELEMENTS ─────────────
-class BatteryInsight {
-  final String emoji;
-  final String message;
-  final String sublabel;
-  final Color color;
+class PowerModeNotifier extends StateNotifier<PowerMode> {
+  PowerModeNotifier() : super(PowerMode.balanced) {
+    _load();
+  }
 
-  const BatteryInsight({
+  void _load() {
+    final box = Hive.box(AppConstants.settingsBox);
+    final saved =
+        box.get(
+              AppConstants.keyPowerMode,
+              defaultValue: AppConstants.modeBalanced,
+            )
+            as String;
+    state = _fromString(saved);
+  }
+
+  void set(PowerMode mode) {
+    Hive.box(
+      AppConstants.settingsBox,
+    ).put(AppConstants.keyPowerMode, _toString(mode));
+    state = mode;
+  }
+
+  PowerMode _fromString(String s) => switch (s) {
+    AppConstants.modePerformance => PowerMode.performance,
+    AppConstants.modeEco => PowerMode.eco,
+    AppConstants.modeUltraSave => PowerMode.ultraSave,
+    _ => PowerMode.balanced,
+  };
+
+  String _toString(PowerMode m) => switch (m) {
+    PowerMode.performance => AppConstants.modePerformance,
+    PowerMode.balanced => AppConstants.modeBalanced,
+    PowerMode.eco => AppConstants.modeEco,
+    PowerMode.ultraSave => AppConstants.modeUltraSave,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTO KILL PROVIDER
+// ─────────────────────────────────────────────────────────────────────────────
+final autoKillProvider = StateNotifierProvider<AutoKillNotifier, bool>((ref) {
+  return AutoKillNotifier();
+});
+
+class AutoKillNotifier extends StateNotifier<bool> {
+  AutoKillNotifier() : super(true) {
+    final box = Hive.box(AppConstants.settingsBox);
+    state =
+        box.get(AppConstants.keyAutoKillEnabled, defaultValue: true) as bool;
+  }
+
+  void toggle() {
+    final next = !state;
+    Hive.box(
+      AppConstants.settingsBox,
+    ).put(AppConstants.keyAutoKillEnabled, next);
+    state = next;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DRAIN HISTORY PROVIDER
+// ─────────────────────────────────────────────────────────────────────────────
+final drainHistoryProvider = Provider<List<DrainEntry>>((ref) {
+  return const [
+    DrainEntry(day: 'MON', drainPct: 55),
+    DrainEntry(day: 'TUE', drainPct: 38),
+    DrainEntry(day: 'WED', drainPct: 68),
+    DrainEntry(day: 'THU', drainPct: 42),
+    DrainEntry(day: 'FRI', drainPct: 72),
+    DrainEntry(day: 'SAT', drainPct: 48),
+    DrainEntry(day: 'SUN', drainPct: 35),
+  ];
+});
+
+class DrainEntry {
+  const DrainEntry({required this.day, required this.drainPct});
+  final String day;
+  final int drainPct;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DRAIN APP MODEL & PROVIDER
+// ─────────────────────────────────────────────────────────────────────────────
+class DrainApp {
+  DrainApp({
+    required this.name,
+    required this.emoji,
+    required this.drainLabel,
+    required this.drainRatio,
+    this.isKilled = false,
+    this.isSafe = false,
+  });
+
+  final String name;
+  final String emoji;
+  final String drainLabel;
+  final double drainRatio;
+  bool isKilled;
+  bool isSafe;
+}
+
+final drainAppsProvider =
+    StateNotifierProvider<DrainAppsNotifier, List<DrainApp>>((ref) {
+      return DrainAppsNotifier();
+    });
+
+class DrainAppsNotifier extends StateNotifier<List<DrainApp>> {
+  DrainAppsNotifier()
+    : super([
+        DrainApp(
+          name: 'Instagram',
+          emoji: '📸',
+          drainLabel: 'Background · 340mAh/hr',
+          drainRatio: 0.85,
+        ),
+        DrainApp(
+          name: 'Spotify',
+          emoji: '🎵',
+          drainLabel: 'Sync idle · 120mAh/hr',
+          drainRatio: 0.45,
+        ),
+        DrainApp(
+          name: 'Google Maps',
+          emoji: '🗺️',
+          drainLabel: 'GPS active · 280mAh/hr',
+          drainRatio: 0.70,
+        ),
+        DrainApp(
+          name: 'Gmail',
+          emoji: '📧',
+          drainLabel: 'Fetch every 5m · 40mAh/hr',
+          drainRatio: 0.20,
+          isSafe: true,
+        ),
+      ]);
+
+  void killApp(int index) {
+    final updated = [...state];
+    updated[index] = DrainApp(
+      name: updated[index].name,
+      emoji: updated[index].emoji,
+      drainLabel: updated[index].drainLabel,
+      drainRatio: updated[index].drainRatio,
+      isKilled: !updated[index].isKilled,
+      isSafe: updated[index].isSafe,
+    );
+    state = updated;
+  }
+
+  void killAll() {
+    state = state
+        .map(
+          (app) => DrainApp(
+            name: app.name,
+            emoji: app.emoji,
+            drainLabel: app.drainLabel,
+            drainRatio: app.drainRatio,
+            isKilled: !app.isSafe,
+            isSafe: app.isSafe,
+          ),
+        )
+        .toList();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI INSIGHTS PROVIDER
+// ─────────────────────────────────────────────────────────────────────────────
+class AiInsight {
+  const AiInsight({
     required this.emoji,
     required this.message,
     required this.sublabel,
     required this.color,
   });
+
+  final String emoji;
+  final String message;
+  final String sublabel;
+  final Color color;
 }
 
-// ── 5. THE PROVIDER DEFINITION FOR THE INSIGHT CARD ──────────────────────────
-final aiInsightsProvider = Provider.autoDispose<List<BatteryInsight>>((ref) {
-  // Watch the real-time battery level to update recommendations dynamically
-  final battery = ref.watch(batteryProvider);
-
-  return [
-    BatteryInsight(
-      emoji: '🔋',
-      message: battery.isCharging
-          ? 'Rapid power delivery active. Thermal parameters nominal.'
-          : 'Discharge cycle optimized. Screen power drain is within safe targets.',
-      sublabel: 'SYSTEM ECO OPTIMIZED',
-      color: AppColors.good, // No longer invalid constant value
+final aiInsightsProvider = Provider<List<AiInsight>>((ref) {
+  return const [
+    AiInsight(
+      emoji: '⚠️',
+      message: 'Instagram drained 22% overnight while screen was off.',
+      sublabel: 'AUTO-RESTRICT SUGGESTED',
+      color: AppColors.warn,
     ),
-    BatteryInsight(
-      emoji: '📱',
-      message: 'Background rogue telemetry tasks were suspended to prevent passive idle drain.',
-      sublabel: 'BACKGROUND APP CONTROL',
-      color: AppColors.good,
+    AiInsight(
+      emoji: '💡',
+      message: 'Enabling Dark Mode saves ~8% daily on your AMOLED screen.',
+      sublabel: 'DISPLAY OPTIMIZATION',
+      color: AppColors.primary,
     ),
-    BatteryInsight(
+    AiInsight(
       emoji: '🌡️',
-      message: 'Battery module operating matrix stable at ideal core health parameters.',
-      sublabel: 'CORE THERMAL STABILITY',
-      color: AppColors.good,
+      message: 'Battery temp spiked to 44°C during gaming on Friday.',
+      sublabel: 'THERMAL ALERT · FRI 8:40PM',
+      color: AppColors.bad,
+    ),
+    AiInsight(
+      emoji: '📍',
+      message:
+          'Location services active in 5 apps you haven\'t opened this week.',
+      sublabel: 'GPS DRAIN DETECTED',
+      color: AppColors.blue,
     ),
   ];
 });
-// ── ADD THIS TO THE BOTTOM OF YOUR dashboard_provider.dart ───────────────────
 
-// 1. Structural data model matching the drain history chart rules
-class DrainHistoryEntry {
-  final String day;
-  final int drainPct;
-
-  const DrainHistoryEntry({
-    required this.day,
-    required this.drainPct,
-  });
-}
-
-// 2. The missing provider definition that returns the 7-day data tracking
-final drainHistoryProvider = Provider.autoDispose<List<DrainHistoryEntry>>((ref) {
-  return [
-    const DrainHistoryEntry(day: 'MON', drainPct: 32),
-    const DrainHistoryEntry(day: 'TUE', drainPct: 58),
-    const DrainHistoryEntry(day: 'WED', drainPct: 74),
-    const DrainHistoryEntry(day: 'THU', drainPct: 42),
-    const DrainHistoryEntry(day: 'FRI', drainPct: 28),
-    const DrainHistoryEntry(day: 'SAT', drainPct: 51),
-    const DrainHistoryEntry(day: 'SUN', drainPct: 15),
-  ];
-});
-// ── ADD THIS TO THE VERY BOTTOM OF YOUR dashboard_provider.dart ──────────────
-
-// 1. Enum expected by FeatureGrid to assign status dot colors
-enum FeatureStatus { active, training, idle }
-
-// 2. Structural data model for individual smart tiles
+// ─────────────────────────────────────────────────────────────────────────────
+// SMART FEATURE MODEL & PROVIDER
+// ─────────────────────────────────────────────────────────────────────────────
 class SmartFeature {
-  final String emoji;
-  final String name;
-  final FeatureStatus status;
-  final bool isEnabled;
-
-  const SmartFeature({
+  SmartFeature({
     required this.emoji,
     required this.name,
+    required this.description,
     required this.status,
-    required this.isEnabled,
+    this.isEnabled = true,
   });
 
-  SmartFeature copyWith({String? emoji, String? name, FeatureStatus? status, bool? isEnabled}) {
-    return SmartFeature(
-      emoji: emoji ?? this.emoji,
-      name: name ?? this.name,
-      status: status ?? this.status,
-      isEnabled: isEnabled ?? this.isEnabled,
-    );
-  }
-}
-
-// 3. State Notifier to handle toggling features on and off smoothly
-class SmartFeaturesNotifier extends AutoDisposeNotifier<List<SmartFeature>> {
-  @override
-  List<SmartFeature> build() {
-    return [
-      const SmartFeature(emoji: '🤖', name: 'AI Drain Predictor', status: FeatureStatus.active, isEnabled: true),
-      const SmartFeature(emoji: '🌡️', name: 'Thermal Throttle', status: FeatureStatus.active, isEnabled: false),
-      const SmartFeature(emoji: '💤', name: 'Deep Sleep Sync', status: FeatureStatus.training, isEnabled: true),
-      const SmartFeature(emoji: '⚡', name: 'Ultra Saving Mode', status: FeatureStatus.idle, isEnabled: false),
-    ];
-  }
-
-  // Handles the interactive toggle updates when a user changes a tile switch state
-  void toggle(int index) {
-    final currentList = [...state];
-    final item = currentList[index];
-    currentList[index] = item.copyWith(isEnabled: !item.isEnabled);
-    state = currentList;
-  }
-}
-
-// 4. Exposed global Riverpod provider instance watched by the FeatureGrid UI layout
-final smartFeaturesProvider = NotifierProvider.autoDispose<SmartFeaturesNotifier, List<SmartFeature>>(() {
-  return SmartFeaturesNotifier();
-});
-
-// ── ADD THIS TO THE ABSOLUTE BOTTOM OF YOUR dashboard_provider.dart ──────────
-
-// 1. Enum defining your hardware profile options
-enum PowerMode { performance, balanced, eco, ultraSave }
-
-// 2. State Notifier to update the active mode state across the app architecture
-class PowerModeNotifier extends AutoDisposeNotifier<PowerMode> {
-  @override
-  PowerMode build() {
-    // Sets default profile to ECO mode on launch (matching your initial UI layout screenshot)
-    return PowerMode.eco;
-  }
-
-  // Updates the state whenever a user clicks a different profile button tile
-  void set(PowerMode dynamicMode) {
-    state = dynamicMode;
-  }
-}
-
-// 3. Exposed global Riverpod provider watched by your interactive Row widget UI
-final powerModeProvider = NotifierProvider.autoDispose<PowerModeNotifier, PowerMode>(() {
-  return PowerModeNotifier();
-});
-
-// ── ADD THIS TO THE ABSOLUTE BOTTOM OF YOUR dashboard_provider.dart ──────────
-
-// 1. Data model tracking individual process memory blocks and execution states
-class DrainAppEntry {
   final String emoji;
   final String name;
-  final String drainLabel;
-  final bool isSafe;
-  final bool isKilled;
+  final String description;
+  FeatureStatus status;
+  bool isEnabled;
+}
 
-  const DrainAppEntry({
-    required this.emoji,
-    required this.name,
-    required this.drainLabel,
-    required this.isSafe,
-    required this.isKilled,
-  });
+final smartFeaturesProvider =
+    StateNotifierProvider<SmartFeaturesNotifier, List<SmartFeature>>((ref) {
+      return SmartFeaturesNotifier();
+    });
 
-  DrainAppEntry copyWith({
-    String? emoji,
-    String? name,
-    String? drainLabel,
-    bool? isSafe,
-    bool? isKilled,
-  }) {
-    return DrainAppEntry(
-      emoji: emoji ?? this.emoji,
-      name: name ?? this.name,
-      drainLabel: drainLabel ?? this.drainLabel,
-      isSafe: isSafe ?? this.isSafe,
-      isKilled: isKilled ?? this.isKilled,
+class SmartFeaturesNotifier extends StateNotifier<List<SmartFeature>> {
+  SmartFeaturesNotifier()
+    : super([
+        SmartFeature(
+          emoji: '🕐',
+          name: 'Sleep Schedule',
+          description: 'Auto-restrict apps during sleep hours.',
+          status: FeatureStatus.active,
+        ),
+        SmartFeature(
+          emoji: '🧠',
+          name: 'AI Learn Mode',
+          description: 'Learns habits, pre-kills before heavy sessions.',
+          status: FeatureStatus.training,
+        ),
+        SmartFeature(
+          emoji: '📍',
+          name: 'Location Saver',
+          description: 'Switches GPS to low-accuracy when stationary.',
+          status: FeatureStatus.active,
+        ),
+        SmartFeature(
+          emoji: '🌙',
+          name: 'Dark Mode AI',
+          description: 'Forces dark theme system-wide on AMOLED.',
+          status: FeatureStatus.off,
+          isEnabled: false,
+        ),
+        SmartFeature(
+          emoji: '📶',
+          name: 'Signal Optimizer',
+          description: 'Drops to 4G in weak 5G zones.',
+          status: FeatureStatus.active,
+        ),
+        SmartFeature(
+          emoji: '🚗',
+          name: 'Drive Mode',
+          description: 'Suspends social apps while driving.',
+          status: FeatureStatus.off,
+          isEnabled: false,
+        ),
+        SmartFeature(
+          emoji: '🔋',
+          name: 'Charge Guardian',
+          description: 'Stops charging at 85% to protect health.',
+          status: FeatureStatus.active,
+        ),
+        SmartFeature(
+          emoji: '📊',
+          name: 'App Budget',
+          description: 'Set mAh limits per app; kills at cap.',
+          status: FeatureStatus.training,
+        ),
+      ]);
+
+  void toggle(int index) {
+    final updated = [...state];
+    final f = updated[index];
+    final next = !f.isEnabled;
+    updated[index] = SmartFeature(
+      emoji: f.emoji,
+      name: f.name,
+      description: f.description,
+      status: next ? FeatureStatus.active : FeatureStatus.off,
+      isEnabled: next,
     );
+    state = updated;
   }
 }
-
-// 2. State Notifier managing interactive process suspension operations
-class DrainAppsNotifier extends AutoDisposeNotifier<List<DrainAppEntry>> {
-  @override
-  List<DrainAppEntry> build() {
-    // Populate with mock apps matching your original UI card screenshot layout
-    return [
-      const DrainAppEntry(emoji: '📸', name: 'Instagram', drainLabel: 'Background • 340mAh/hr', isSafe: false, isKilled: false),
-      const DrainAppEntry(emoji: '🎵', name: 'Spotify', drainLabel: 'Sync Idle • 120mAh/hr', isSafe: false, isKilled: false),
-      const DrainAppEntry(emoji: '💬', name: 'WhatsApp', drainLabel: 'Push Sync active', isSafe: true, isKilled: false),
-      const DrainAppEntry(emoji: '🎮', name: 'Dead Cells', drainLabel: 'Cached RAM Sleep', isSafe: false, isKilled: false),
-    ];
-  }
-
-  // Toggles the termination state of a single specific task
-  void killApp(int index) {
-    final currentList = [...state];
-    final app = currentList[index];
-    if (!app.isSafe) {
-      currentList[index] = app.copyWith(isKilled: !app.isKilled);
-      state = currentList;
-    }
-  }
-
-  // Mass suspends all volatile background tasks simultaneously
-  void killAll() {
-    state = state.map((app) {
-      return app.isSafe ? app : app.copyWith(isKilled: true);
-    }).toList();
-  }
-}
-
-// 3. Exposed global Riverpod provider channel watched by your SmartKillCard UI
-final drainAppsProvider = NotifierProvider.autoDispose<DrainAppsNotifier, List<DrainAppEntry>>(() {
-  return DrainAppsNotifier();
-});

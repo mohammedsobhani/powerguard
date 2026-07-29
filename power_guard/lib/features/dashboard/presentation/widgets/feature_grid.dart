@@ -76,12 +76,16 @@ class FeatureGrid extends ConsumerWidget {
                       child: Switch(
                         value: feature.isEnabled,
                         activeThumbColor: AppColors.primary,
-                        activeTrackColor: AppColors.primary.withValues(alpha: 0.2),
+                        activeTrackColor: AppColors.primary.withValues(
+                          alpha: 0.2,
+                        ),
                         inactiveThumbColor: AppColors.mutedDark,
                         inactiveTrackColor: AppColors.surface2Dark,
                         onChanged: (val) {
                           HapticFeedback.lightImpact();
-                          ref.read(smartFeaturesProvider.notifier).toggle(index);
+                          ref
+                              .read(smartFeaturesProvider.notifier)
+                              .toggle(index);
                         },
                       ),
                     ),
